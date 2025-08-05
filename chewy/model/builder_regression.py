@@ -20,7 +20,7 @@ from torch.optim import AdamW
 from flash.core.optimizers import LinearWarmupCosineAnnealingLR
 
 from chewy.model.encoder import ChewyEncoder
-from chewy.model.graph_regressor import GraphRegressor
+from chewy.model.components.graph_regressor import GraphRegressor
 
 sns.set_theme(style="whitegrid")
 sns.set_context("paper", font_scale=1.5)

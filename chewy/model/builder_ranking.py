@@ -17,7 +17,7 @@ from torch.optim import AdamW
 from flash.core.optimizers import LinearWarmupCosineAnnealingLR
 
 from chewy.model.encoder import ChewyEncoder
-from chewy.model.graph_regressor import GraphRegressor
+from chewy.model.components.graph_regressor import GraphRegressor
 
 sns.set_theme(style="whitegrid")
 sns.set_context("paper", font_scale=1.5)
@@ -98,11 +98,12 @@ class Chewy(L.LightningModule):
             B_z: (Tensor) shape (Nb, C)
             G_z: (Tensor) shape (Ng, C)
         """
+        
         B_z = self.B_encoder_block(
-            batch.x_b, batch[0].edge_index_b
+            batch.x_b, batch.edge_index_b
         )  
         G_z = self.G_encoder_block(
-            batch.x_g, batch[0].edge_index_g
+            batch.x_g, batch.edge_index_g
         )  
 
         return B_z, G_z

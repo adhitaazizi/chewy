@@ -3,7 +3,8 @@ from typing import List
 import torch
 import torch.nn as nn
 from torch_geometric.transforms import AddLaplacianEigenvectorPE
-from chewy.model.module import GATModule
+from chewy.model.components.module import GATModule
+from chewy.model.signnet import SignNet
     
 class ChewyEncoder(nn.Module):
     """
@@ -16,7 +17,7 @@ class ChewyEncoder(nn.Module):
         heads: int = 1,
         dropout: float = 0.0,
         pe_k: int = 8,
-        pe_out_dim: int = 32, # Output dimension for SignNet
+        pe_out_dim: int = 64, # Output dimension for SignNet
         use_pe: bool = True,
     ):
         super().__init__()
@@ -27,7 +28,14 @@ class ChewyEncoder(nn.Module):
         self.pe_k = pe_k
         
         if self.use_pe:
-            self.sign_net = SignNet(in_channels=input_dim, hidden_dim=64, out_dim=pe_out_dim)
+            self.transform = AddLaplacianEigenvectorPE(k=self.pe_k, attr_name='lap_eigvec', is_undirected=True)
+            self.sign_net = SignNet(
+                in_channels=1,
+                phi_out_dim=16, # Output dim of the phi network
+                num_phi_layers=2,
+                rho_out_dim=pe_out_dim, # Final output dim of SignNet
+                num_rho_layers=2
+            )
             effective_input_dim = input_dim + pe_out_dim
         else:
             effective_input_dim = input_dim
@@ -62,12 +70,11 @@ class ChewyEncoder(nn.Module):
     def forward(self, data):
         x = data.x  
         edge_index = data.edge_index
+        data = self.transform(data)
         
         if self.use_pe:
-            # Assuming Laplacian eigenvectors are stored in data.lap_eigvec
-            # You would typically compute this using a transform, e.g., AddLaplacianEigenvectorPE
             pe = self.sign_net(data.lap_eigvec[:, :self.pe_k])
-            x = torch.cat([x, pe], dim=-1) # [cite: 92]
+            x = torch.cat([x, pe], dim=-1) 
         
         # Pass through all layers
         for layer in self.layers:

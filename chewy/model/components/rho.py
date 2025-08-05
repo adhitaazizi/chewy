@@ -8,10 +8,12 @@ class RhoModule:
         super().__init__()
 
         self.convs = nn.ModuleList([GATv2Conv(
-            in_channels=n_in,
+            in_channels=n_in if i == 0 else n_out,
             out_channels=n_out,
             heads=heads,
-            dropout=dropout
+            dropout=dropout,
+            concat=False,  # Average heads instead of concatenating
+            residual=True if n_in != 0 else False
         ) for i in range(num_layers)])
         self.norms = nn.ModuleList([LayerNorm() for _ in range(num_layers)])
         self.activations = nn.ModuleList([nn.Relu(inplace=True)])
