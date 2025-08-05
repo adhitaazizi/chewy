@@ -8,6 +8,7 @@ python-dotenv
 pytorch-lightning
 rich
 rich-click
+rootutils
 safetensors
 scikit-learn
 scipy
