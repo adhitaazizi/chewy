@@ -5,7 +5,7 @@ import torch.nn as nn
 from torch_geometric.transforms import AddLaplacianEigenvectorPE
 from chewy.model.module import GATModule
     
-class DeeperGATEncoder(nn.Module):
+class ChewyEncoder(nn.Module):
     """
     DeeperGCN-style GAT Encoder with deep architecture capabilities
     """

@@ -1,24 +1,38 @@
+# Copyright (c) 2025, Chunan Liu and Aurélien Plüsser
+# All rights reserved.
+#
+# This source code is licensed under the CC BY-NC-SA 4.0 license found in the
+# LICENSE file in the root directory of this source tree.
+
 from typing import Any, Dict, List, Optional, Tuple
 
 import lightning as L
+import pandas as pd
 import seaborn as sns
 import torch
 import torch.nn as nn
+import wandb
 from loguru import logger
+
 from torch import Tensor
 from torch_geometric.data import Batch as PygBatch
 from torch.optim import AdamW
+from flash.core.optimizers import LinearWarmupCosineAnnealingLR
 
-from chewy.model.encoder import DeeperGATEncoder
+from chewy.model.encoder import ChewyEncoder
 from chewy.model.graph_regressor import GraphRegressor
 
 sns.set_theme(style="whitegrid")
 sns.set_context("paper", font_scale=1.5)
 sns.set_palette("Set2")
 
+def accuracy_metric(pred_rank_label: Tensor, true_rank_label: Tensor) -> Tensor:
+    """Calculate accuracy for ranking predictions."""
+    return (pred_rank_label == true_rank_label).float().mean()
 
-class DeeperGAT(L.LightningModule):
-    def __init__(self, enc_layers, opt = None, scheduler=None):
+# Regression model: from WALLE-Affinity with modified encoder
+class ChewyRegression(L.LightningModule):
+    def __init__(self, num_steps, warm_up_epochs, scheduler=None):
         super().__init__()
         # store the loss for each batch in an epoch
         self.training_loss_epoch = []
@@ -40,22 +54,23 @@ class DeeperGAT(L.LightningModule):
             {}
         )  # e.g. {"generalization": [], "perturbation": []} for multiple test sets
         self.test_results = {}  # for storing test results
-
-        self.opt = AdamW(lr=1e-5, weight_decay=0.0) if not opt else opt
-        self.schduler = scheduler
+        
+        self.num_steps = num_steps
+        self.warm_up_epochs = warm_up_epochs
+        self.scheduler = scheduler
 
         logger.info("Instantiating encoder blocks ...")
-        self.B_encoder_block = DeeperGATEncoder(
+        self.B_encoder_block = ChewyEncoder(
                                     node_feat_name="x_b", 
                                     edge_index_name="edge_index_b",
                                     input_dim=512,
-                                    dim_list=[]
+                                    dim_list=[512, 512, 512, 512, 512, 512, 512, 128, 64]
                                 )
-        self.G_encoder_block = DeeperGATEncoder(
+        self.G_encoder_block = ChewyEncoder(
                                     node_feat_name="x_b", 
                                     edge_index_name="edge_index_b",
                                     input_dim=1280,
-                                    dim_list=[]
+                                    dim_list=[1280, 1280, 1280, 1280, 1280, 1280, 1280, 128, 64]
         )
         logger.info(self.B_encoder_block)
         logger.info(self.G_encoder_block)
@@ -84,27 +99,27 @@ class DeeperGAT(L.LightningModule):
         """
         B_z = self.B_encoder_block(
             batch.x_b, batch.edge_index_b
-        )  
+        )  # (batch.x_b.shape[0], C), e.g.  C=64 depends on the config
         G_z = self.G_encoder_block(
             batch.x_g, batch.edge_index_g
-        )  
+        )  # (batch.x_g.shape[0], C), e.g.  C=64 depends on the config
 
         return B_z, G_z
-
+    
     def forward(self, batch: PygBatch) -> Tensor:
         # encode
         z_ab, z_ag = self.encode(batch)
         # regression
         affinity_pred = self.regressor(z_ab, z_ag, batch)
+        affinity_pred = torch.clamp(affinity_pred, -12, 12)
         return affinity_pred
 
     # --------------------------------------------------------------------------
     # Configure
     # --------------------------------------------------------------------------
     def configure_optimizers(self):
-        optimizer = self.opt 
+        optimizer = AdamW(self.parameters(), lr=1e-5, weight_decay=0.0)
         logger.info(f"Optimizer: {optimizer}")
-        optimizer = optimizer(self.parameters())
 
         if self.scheduler is not None:
             logger.info("Instantiating scheduler...")
@@ -117,7 +132,12 @@ class DeeperGAT(L.LightningModule):
                 "name": "learning_rate",
 
             }
-            scheduler["scheduler"] = scheduler["scheduler"](optimizer=optimizer)
+            scheduler["scheduler"] = LinearWarmupCosineAnnealingLR(
+                warmup_epochs= self.warm_up_epochs,  
+                warmup_start_lr= 0.0,
+                max_epochs=self.num_steps,
+                optimizer=optimizer
+            )
             optimizer_config = {
                 "optimizer": optimizer,
                 "lr_scheduler": scheduler,
@@ -138,43 +158,35 @@ class DeeperGAT(L.LightningModule):
 
         """
         # rank loss nn.MarginRankingLoss(margin=0.5)
-        return {
-            "MarginRankingLoss": nn.MarginRankingLoss(
-                margin=0.1
-            )
-        }
+        return {"mse": nn.MSELoss()}
 
     def configure_metric_func_dict(self):
         """
         Configure the metric function dictionary
         """
 
-        def _accuracy(pred_rank_label: Tensor, true_rank_label: Tensor) -> Tensor:
-            return (pred_rank_label == true_rank_label).float().mean()
-
-        return {"accuracy": _accuracy}
+        return {"accuracy": accuracy_metric}
+    
+    
 
     # --------------------------------------------------------------------------
     # Custom methods
     # --------------------------------------------------------------------------
     def compute_loss(
         self,
-        y_pred1: Tensor,  # e.g. affinity
-        y_pred2: Tensor,  # e.g. affinity
-        ranking_labels: Tensor,  # e.g. 1 or -1, if y_pred1 > y_pred2, then ranking_labels = 1, otherwise -1
+        pred_y: Tensor,
+        true_y: Tensor,
         stage: str,
     ) -> Dict[str, Tensor]:
-        if y_pred1.ndim == 2:
-            y_pred1 = y_pred1.squeeze()
-        if y_pred2.ndim == 2:
-            y_pred2 = y_pred2.squeeze()
-        if ranking_labels.ndim == 2:
-            ranking_labels = ranking_labels.squeeze()
+        if pred_y.ndim == 2:
+            pred_y = pred_y.squeeze()
+        if true_y.ndim == 2:
+            true_y = true_y.squeeze()
 
         # compute loss
         loss_dict = {
             f"{stage}/loss/{k}": v(
-                y_pred1.float(), y_pred2.float(), ranking_labels.float()
+                pred_y.float(), true_y.float()
             )
             for k, v in self.loss_func_dict.items()
         }
@@ -211,16 +223,14 @@ class DeeperGAT(L.LightningModule):
     # Step Hooks
     # --------------------------------------------------------------------------
     def _one_step(
-        self, batch1: PygBatch, batch2: PygBatch, ranking_labels: Tensor, stage: str
+        self, batch: PygBatch, stage: str
     ) -> Tuple[Dict[str, Tensor], Tensor]:
         # forward
-        y_pred1: Tensor = self.forward(batch1)  # (B, 1)
-        y_pred2: Tensor = self.forward(batch2)  # (B, 1)
-        label_pred: Tensor = (y_pred1 > y_pred2).float() * 2 - 1
+        pred_y: Tensor = self.forward(batch)  # (B, 1)
 
         # compute loss
         loss_dict = self.compute_loss(
-            y_pred1=y_pred1, y_pred2=y_pred2, ranking_labels=ranking_labels, stage=stage
+            pred_y=pred_y, true_y=batch.y, stage=stage
         )
 
         # NOTE: add key value pair `"loss": loss_value` the loss dict to return after each step
@@ -229,45 +239,41 @@ class DeeperGAT(L.LightningModule):
         loss_values = list(loss_dict.values())
         loss_dict["loss"] = loss_values[0]
 
-        return loss_dict, label_pred
+        return loss_dict, pred_y
 
     def training_step(
-        self, batch: Tuple[PygBatch, PygBatch, Tensor], batch_idx: int
+        self, batch: PygBatch, batch_idx: int
     ) -> Tensor:
         # compute loss
-        loss_dict, label_pred = self._one_step(
-            batch1=batch[0],
-            batch2=batch[1],
-            ranking_labels=batch[2],
+        loss_dict, pred_y = self._one_step(
+            batch=batch,
             stage="train",
         )
         # store loss for each batch in an epoch
         self.training_loss_epoch.append(loss_dict["loss"])
         # store pred labels for each batch in an epoch
-        self.training_pred_labels_epoch.append(label_pred.squeeze())  # (B,)
+        self.training_pred_y_epoch.append(pred_y.squeeze())  # (B,)
         # store true labels for each batch in an epoch
-        self.training_true_labels_epoch.append(batch[2].squeeze())  # (B,)
+        self.training_true_y_epoch.append(batch.y.squeeze())  # (B,)
         # determine if we are in a distributed setting
         is_distributed = self.trainer.world_size > 1
         self.log_step(loss_dict, sync_dist=is_distributed)
         return loss_dict["loss"]
 
     def validation_step(
-        self, batch: Tuple[PygBatch, PygBatch, Tensor], batch_idx: int
+        self, batch: PygBatch, batch_idx: int
     ) -> Tensor:
         # compute loss
-        loss_dict, label_pred = self._one_step(
-            batch1=batch[0],
-            batch2=batch[1],
-            ranking_labels=batch[2],
+        loss_dict, pred_y = self._one_step(
+            batch=batch,
             stage="val",
         )
         # store loss for each batch in an epoch
         self.validation_loss_epoch.append(loss_dict["loss"])
         # store pred labels for each batch in an epoch
-        self.validation_pred_labels_epoch.append(label_pred.squeeze())  # (B,)
+        self.validation_pred_y_epoch.append(pred_y.squeeze())  # (B,)
         # store true labels for each batch in an epoch
-        self.validation_true_labels_epoch.append(batch[2].squeeze())  # (B,)
+        self.validation_true_y_epoch.append(batch.y.squeeze())  # (B,)
         # determine if we are in a distributed setting
         is_distributed = self.trainer.world_size > 1
         self.log_step(loss_dict, sync_dist=is_distributed)
@@ -275,59 +281,35 @@ class DeeperGAT(L.LightningModule):
 
     def test_step(
         self,
-        batch: Tuple[PygBatch, PygBatch, Tensor],
+        batch: PygBatch,
         batch_idx: int,
         dataloader_idx: int = 0,
     ) -> Tensor:
         """
         Test set is packed in a single batch. This function is called only once
         for the entire test set.
+        NOTE: the test set doesn't have true y, we only run a forward pass
         """
         # NOTE: input test dataloader is a dict of two loaders
         # e.g. test_dataloader = {"generalization": dl1, "perturbation": dl2}
         test_name = list(self.test_dataloader.keys())[dataloader_idx]
-        # compute loss
-        loss_dict, label_pred = self._one_step(
-            batch1=batch[0],
-            batch2=batch[1],
-            ranking_labels=batch[2],
-            stage="test",
-        )
-        # initialize the list if the test set is not in the list
-        if test_name not in self.test_loss_epoch:
-            self.test_loss_epoch[test_name] = []
-            self.test_pred_labels_epoch[test_name] = []
-            self.test_true_labels_epoch[test_name] = []
-        # append loss value to the list
-        self.test_loss_epoch[test_name].append(loss_dict["loss"])
-        # store pred labels for each batch in an epoch
-        self.test_pred_labels_epoch[test_name].append(label_pred.squeeze())  # (B,)
-        # store true labels for each batch in an epoch
-        self.test_true_labels_epoch[test_name].append(batch[2].squeeze())  # (B,)
-        # determine if we are in a distributed setting
-        is_distributed = self.trainer.world_size > 1
-        self.log_step(loss_dict, sync_dist=is_distributed)
-
-        return loss_dict["loss"]
+        names = batch.name
+        pred_y: Tensor = self.forward(batch)  # (B, 1)
+        d = [(n, p) for n, p in zip(names, pred_y.squeeze())]
+        if test_name not in self.test_pred_y_epoch:
+            self.test_pred_y_epoch[test_name] = []
+        # store pred y for each batch in an epoch
+        self.test_pred_y_epoch[test_name].extend(d)
 
     def predict_step(
-        self,
-        batch: Tuple[PygBatch, PygBatch, Tensor],
-        batch_idx: int,
-        return_pred_values: bool = False,
+        self, batch: PygBatch, batch_idx: int
     ) -> Tensor:
         """
         This function is called during inference.
         """
         # forward
-        y_pred1 = self.forward(batch[0])  # (B, 1)
-        y_pred2 = self.forward(batch[1])  # (B, 1)
-        # predicted labels convert to 1 or -1
-        label_pred = (y_pred1 > y_pred2).float() * 2 - 1
-        if return_pred_values:
-            return label_pred, y_pred1, y_pred2
-        else:
-            return label_pred
+        y_pred = self.forward(batch)  # (B, 1)
+        return y_pred
 
     # --------------------------------------------------------------------------
     # Epoch Hooks
@@ -341,24 +323,20 @@ class DeeperGAT(L.LightningModule):
         # Log with sync_dist=True if in distributed setting
         sync_dist = is_distributed
 
-        # store pred labels for each batch in an epoch
-        pred_labels = torch.cat(self.training_pred_labels_epoch, dim=0)
-        true_labels = torch.cat(self.training_true_labels_epoch, dim=0)
+        pred_y = torch.cat(self.training_pred_y_epoch, dim=0)
+        true_y = torch.cat(self.training_true_y_epoch, dim=0)
 
         # calculate accuracy
-        acc = self.metric_func_dict["accuracy"](pred_labels, true_labels)
+        mse = self.loss_func_dict["mse"](pred_y, true_y)
 
         # Log the average loss
         self.log_epoch(log_dict={"train/loss/avg": avg_loss}, sync_dist=sync_dist)
-        self.log_epoch(log_dict={"train/accuracy": acc}, sync_dist=sync_dist)
-
-        # # Log the average loss to console
-        # logger.info(f"Epoch {self.current_epoch} loss: {avg_loss}")
+        self.log_epoch(log_dict={"train/mse": mse}, sync_dist=sync_dist)
 
         # Clear lists for the next epoch
         self.training_loss_epoch.clear()
-        self.training_pred_labels_epoch.clear()
-        self.training_true_labels_epoch.clear()
+        self.training_pred_y_epoch.clear()
+        self.training_true_y_epoch.clear()
 
     def on_validation_epoch_end(self) -> None:
         avg_loss = torch.stack(self.validation_loss_epoch).mean()
@@ -366,51 +344,54 @@ class DeeperGAT(L.LightningModule):
         # Check if we are in a distributed setting
         is_distributed = self.trainer.world_size > 1
 
-        # store pred labels for each batch in an epoch
-        pred_labels = torch.cat(self.validation_pred_labels_epoch, dim=0)
-        true_labels = torch.cat(self.validation_true_labels_epoch, dim=0)
+        # store pred y for each batch in an epoch
+        pred_y = torch.cat(self.validation_pred_y_epoch, dim=0)
+        true_y = torch.cat(self.validation_true_y_epoch, dim=0)
 
         # calculate accuracy
-        acc = self.metric_func_dict["accuracy"](pred_labels, true_labels)
+        mse = self.loss_func_dict["mse"](pred_y, true_y)
 
         # Log with sync_dist=True if in distributed setting
         sync_dist = is_distributed
 
         # Log the average loss
         self.log_epoch(log_dict={"val/loss/avg": avg_loss}, sync_dist=sync_dist)
-        self.log_epoch(log_dict={"val/accuracy": acc}, sync_dist=sync_dist)
+        self.log_epoch(log_dict={"val/mse": mse}, sync_dist=sync_dist)
 
         # Clear lists for the next epoch
         self.validation_loss_epoch.clear()
-        self.validation_pred_labels_epoch.clear()
-        self.validation_true_labels_epoch.clear()
+        self.validation_pred_y_epoch.clear()
+        self.validation_true_y_epoch.clear()
 
     def on_test_epoch_end(self) -> None:
-        for test_name in self.test_loss_epoch:
-            avg_loss = torch.stack(self.test_loss_epoch[test_name]).mean()
-
+        # NOTE: test set doesn't have true y, we only upload a csv file artifact
+        # storing graph pair name and pred y for later usage
+        for test_name in self.test_pred_y_epoch:
             # Check if we are in a distributed setting
             is_distributed = self.trainer.world_size > 1
 
-            # store pred labels for each batch in an epoch
-            pred_labels = torch.cat(self.test_pred_labels_epoch[test_name], dim=0)
-            true_labels = torch.cat(self.test_true_labels_epoch[test_name], dim=0)
+            # store pred y for each batch in an epoch
+            names, pred_y = zip(*self.test_pred_y_epoch[test_name])
+            names = list(names)
+            # move each item in pred_y to cpu and to float
+            pred_y = [p.item() for p in pred_y]
+            df = pd.DataFrame({"name": names, "pred_y": pred_y})
 
-            # calculate accuracy
-            acc = self.metric_func_dict["accuracy"](pred_labels, true_labels)
-
-            # Log with sync_dist=True if in distributed setting
-            sync_dist = is_distributed
-
-            # Log the average loss
-            self.log_epoch(
-                log_dict={f"test/{test_name}/loss/avg": avg_loss}, sync_dist=sync_dist
-            )
-            self.log_epoch(
-                log_dict={f"test/{test_name}/accuracy": acc}, sync_dist=sync_dist
-            )
+            # Save DataFrame to a temporary CSV file
+            import os
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix='.csv', delete=False) as tmp:
+                df.to_csv(tmp.name, index=False)
+                # create an artifact
+                artifact = wandb.Artifact(
+                    name=f"test_{test_name}",
+                    type="test",
+                    description=f"Test set for {test_name}",
+                )
+                artifact.add_file(tmp.name, name=f"{test_name}.csv")
+                self.logger.experiment.log_artifact(artifact)
+                # Clean up the temporary file
+                os.unlink(tmp.name)
 
             # Clear lists for the next epoch
-            self.test_loss_epoch[test_name].clear()
-            self.test_pred_labels_epoch[test_name].clear()
-            self.test_true_labels_epoch[test_name].clear()
+            self.test_pred_y_epoch[test_name].clear()

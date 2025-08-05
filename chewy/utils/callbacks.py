@@ -38,7 +38,7 @@ def set_callbacks(output_dir: str):
     early_stopping = EarlyStopping(
         monitor="val/accuracy",
         min_delta=0.001,
-        patience=10,
+        patience=5,
         verbose=True,
         mode="max",
         strict=True,

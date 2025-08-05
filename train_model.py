@@ -4,6 +4,8 @@ Main script for training models using the train_model function.
 Provides command line interface for all training parameters.
 """
 
+from typing import Dict
+
 import argparse
 import logging
 import sys
@@ -40,13 +42,13 @@ def parse_args():
         "--device",
         type=str,
         required=True,
-        choices=["cpu", "gpu", "cuda", "mps", "tpu"],
+        choices=["cpu", "gpu", "tpu"],
         help="Device to use for training"
     )
     
     parser.add_argument(
-        "--train-split-path",
-        type=str,
+        "--split",
+        type=dict,
         required=True,
         help="Path to the training split CSV file (relative to root/AbRank/splits/Split_AF3/)"
     )
@@ -83,50 +85,13 @@ def parse_args():
     )
     
     parser.add_argument(
-        "--wandb-project",
-        type=str,
+        "--wandb",
+        type=dict,
         default=None,
         help="WandB project name for logging experiments"
     )
     
-    parser.add_argument(
-        "--wandb-entity",
-        type=str,
-        default=None,
-        help="WandB entity (username or team name) for logging experiments"
-    )
-    
     return parser.parse_args()
-
-
-def validate_args(args):
-    """Validate command line arguments."""
-    # Check if root directory exists
-    root_path = Path(args.root)
-    if not root_path.exists():
-        logger.error(f"Root directory does not exist: {args.root}")
-        sys.exit(1)
-    
-    # Check if checkpoint path exists (if provided)
-    if args.ckpt_path:
-        ckpt_path = Path(args.ckpt_path)
-        if not ckpt_path.exists():
-            logger.error(f"Checkpoint file does not exist: {args.ckpt_path}")
-            sys.exit(1)
-    
-    # Check if train split path exists
-    train_split_full_path = root_path / "AbRank" / "splits" / "Split_AF3" / args.train_split_path
-    if not train_split_full_path.exists():
-        logger.warning(f"Training split file may not exist: {train_split_full_path}")
-        # Don't exit here as the file might be created by the training process
-    
-    # Validate seed range
-    if args.seed is not None:
-        if args.seed < 0 or args.seed >= 2**32:
-            logger.error(f"Seed must be between 0 and {2**32-1}")
-            sys.exit(1)
-    
-    logger.info("Argument validation passed")
 
 
 def main():
@@ -135,9 +100,6 @@ def main():
     
     # Parse arguments
     args = parse_args()
-    
-    # Validate arguments
-    validate_args(args)
     
     # Log the configuration
     logger.info("Training configuration:")
@@ -151,30 +113,18 @@ def main():
     logger.info(f"  WandB project: {args.wandb_project}")
     logger.info(f"  WandB entity: {args.wandb_entity}")
     
-    try:
-        # Call the train_model function
-        train_model(
-            root=args.root,
-            device=args.device,
-            train_split_path=args.train_split_path,
-            task=args.task,
-            ckpt_path=args.ckpt_path,
-            scheduler=args.scheduler,
-            seed=args.seed,
-            wandb_project=args.wandb_project,
-            wandb_entity=args.wandb_entity
-        )
+    # Call the train_model function
+    train_model(
+        root=args.root,
+        device=args.device,
+        split=args.split,
+        task=args.task,
+        ckpt_path=args.ckpt_path,
+        scheduler=args.scheduler,
+        seed=args.seed,
+        wandb=args.wandb
+    )
         
-        # For now, just log that we would call the function
-        logger.info("Would call train_model with the provided arguments")
-        logger.info("Please uncomment the train_model call and import statement")
-        
-    except Exception as e:
-        logger.error(f"Training failed with error: {e}")
-        sys.exit(1)
-    
-    logger.info("Training script completed successfully")
-
 
 if __name__ == "__main__":
     main()

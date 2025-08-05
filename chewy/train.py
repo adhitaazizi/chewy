@@ -10,16 +10,15 @@ import wandb
 from lightning.pytorch.loggers.wandb import WandbLogger
 from loguru import logger
 from torch_geometric.loader import DataLoader as PyGDataLoader
+from torch.optim import AdamW
 
 from chewy.data.abrank_datamodule import AbRankDataModule
-from chewy.model.builder import DeeperGAT
-from chewy import utils
-from flash.core.optimizers import LinearWarmupCosineAnnealingLR
-
-# ==================== Configuration ====================
-rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
-
-BASE = Path(__file__).parent
+from chewy.data.abrank_regression_datamodule import AbRankRegressionDataModule
+from chewy.model.builder_ranking import Chewy
+from chewy.model.builder_regression import ChewyRegression
+from chewy.utils.callbacks import set_callbacks
+from chewy.utils.loggers import set_loggers
+from chewy.utils.wandb import upload_ckpts_to_wandb, log_default_root_dir, log_run_dir
 
 # set precision to trade off precision for performance
 torch.set_float32_matmul_precision(precision="medium")
@@ -54,10 +53,10 @@ def _num_training_steps(train_dataloader: PyGDataLoader, trainer: L.Trainer) -> 
     )
     return (dataset_size // effective_batch_size) * trainer.max_epochs
 
-def train_model(root, device, train_split_path, task, ckpt_path, wandb_project, wandb_entity, scheduler=None, seed = None) -> None:
+def train_model(root, device, task, split, ckpt_path, wandb, scheduler=None, seed = None) -> None:
     """
     Train model using Lightning trainer and WandB.
-    
+
     Args:
         root (str): Root directory path for the dataset and output.
         device (str): Device to use for training (e.g., 'cpu', 'gpu', 'cuda').
@@ -68,7 +67,7 @@ def train_model(root, device, train_split_path, task, ckpt_path, wandb_project, 
         seed (int, optional): Random seed for reproducibility. If None, generates a random seed.
         wandb_project (str, optional): WandB project name for logging experiments.
         wandb_entity (str, optional): WandB entity (username or team name) for logging experiments.
-    
+
     """
     # set seed for random number generators in pytorch, numpy and python.random
     if seed is None:
@@ -79,21 +78,23 @@ def train_model(root, device, train_split_path, task, ckpt_path, wandb_project, 
     # ----------------------------------------
     # Instantiate datamodule
     # ----------------------------------------
-    logger.info(f"Instantiating datamodule: <{task} Data Module>...")
-    dm: L.LightningDataModule = AbRankDataModule(
-        root=root,
-        train_split_path= os.path.join(root, 'AbRank', 'splits', 'Split_AF3', train_split_path),# NOTE: must be set in the main config
-        test_split_path_dict= {
-            "generalization": os.path.join(root, 'AbRank', 'splits', 'Split_AF3', 'test-generalization.csv'),
-            "perturbation": os.path.join(root, 'AbRank', 'splits', 'Split_AF3', 'test-perturbation.csv'),
+    logger.info(f"Instantiating datamodule: <Train Data Module>...")
+    datamodule_args = {
+        'root':root,
+        'train_split_path':split['train_split_path'],# NOTE: must be set in the main config
+        'test_split_path_dict':{
+            "generalization": split['test-generalization'],
+            "perturbation": split['test-perturbation'],
         }, # NOTE: must be set in the main config
-        seed=seed, # NOTE: if null, will generate automatically; for reproducibility can set in the main config
-        num_workers=4,
-        batch_size=32, # Batch size for dataloader
-        shuffle=True,
-        follow_batch=["x_b", "x_g"],
-        exclude_keys=["metadata", "y", "y_b", "y_g", "edge_index_bg"]
-    )
+        'seed':seed, # NOTE: if null, will generate automatically; for reproducibility can set in the main config
+        'num_workers':2,
+        'batch_size':32, # Batch size for dataloader
+        'shuffle':True,
+        'follow_batch':["x_b", "x_g"],
+        'exclude_keys':["metadata", "y", "y_b", "y_g", "edge_index_bg"]
+
+    }
+    dm: L.LightningDataModule = AbRankRegressionDataModule(**datamodule_args) if task == "Regression" else AbRankDataModule(**datamodule_args)
 
     # setup and prepare data
     dm.prepare_data()
@@ -103,10 +104,10 @@ def train_model(root, device, train_split_path, task, ckpt_path, wandb_project, 
     # Instantiate callbacks, loggers
     # ----------------------------------------
     logger.info("Instantiating callbacks...")
-    callbacks = set_callbacks(os.paths.join(root, "output"))
+    callbacks = set_callbacks(os.path.join(root, "output", split['name']))
 
     logger.info("Instantiating loggers...")
-    L_logger = set_loggers(wandb_project, wandb_entity)
+    L_logger = [set_loggers(wandb['project'], wandb['entity'], split['name'])]
     # if logger is wandb, initialise it via :func:experiment
     wandb_run = None
     run_name = uuid.uuid4().hex  # in case the wandb run is not initialized
@@ -140,52 +141,48 @@ def train_model(root, device, train_split_path, task, ckpt_path, wandb_project, 
         limit_test_batches = 1.0,
     )
 
-    # ----------------------------------------
-    # Scheduler
-    # ----------------------------------------
-    if scheduler == "CosineAnnealing":
-        dm.setup()  # type: ignore
-        num_steps = _num_training_steps(dm.train_dataloader(), trainer)  # => 10_000
-        logger.info(
-            f"Setting number of training steps in scheduler to: {num_steps}"
-        )
-        scheduler = LinearWarmupCosineAnnealingLR(
-            warmup_epochs= trainer.val_check_interval,  
-            warmup_start_lr= 0.0,
-            max_epochs=num_steps
-        )
-        logger.info("Scheduler set up")
 
     # ----------------------------------------
     # Model
     # ----------------------------------------
+    dm.setup()  # type: ignore
+    num_steps = _num_training_steps(dm.train_dataloader(), trainer)  # => 10_000
+    logger.info(
+        f"Setting number of training steps in scheduler to: {num_steps}"
+    )
+
     logger.info("Instantiating model...")
-    model: L.LightningModule = DeeperGAT(scheduler=scheduler)
+    model_args = {
+        'num_steps': num_steps, 
+        'warm_up_epochs': trainer.val_check_interval, 
+        'scheduler': scheduler
+    }
+    model: L.LightningModule = ChewyRegression(**model_args) if task == "Regression" else Chewy(**model_args)
 
     # ----------------------------------------
     # Model initialization
     # ----------------------------------------
-    logger.info("Initializing lazy layers...")
-    with torch.no_grad():
-        dm.setup(stage="lazy_init")  # type: ignore
-        batch = next(iter(dm.val_dataloader()))
-        logger.info(f"Batch: {batch}")
-        logger.info(f"Labels: {model.get_labels(batch)}")
-        # forward pass
-        out = model(batch)
-        logger.info(f"Model output: {out}")
-        del batch, out
+    # logger.info("Initializing lazy layers...")
+    # with torch.no_grad():
+    #     dm.setup(stage="lazy_init")  # type: ignore
+    #     batch = next(iter(dm.val_dataloader()))
+    #     print(batch)
+    #     print(batch[0].x_b)
+    #     logger.info(f"Batch: {batch}")
+    #     # forward pass
+    #     out = model(batch)
+    #     logger.info(f"Model output: {out}")
+    #     del batch, out
 
     # ----------------------------------------
     # Training
     # ----------------------------------------
-    if task == "train":
-        logger.info("Starting training!")
-        trainer.fit(
-            model=model,
-            datamodule=dm,
-            ckpt_path=ckpt_path,  # resume from checkpoint
-        )
+    logger.info("Starting training!")
+    trainer.fit(
+        model=model,
+        datamodule=dm,
+        ckpt_path=ckpt_path,  # resume from checkpoint
+    )
 
     # ----------------------------------------
     # Testing
@@ -226,4 +223,3 @@ def train_model(root, device, train_split_path, task, ckpt_path, wandb_project, 
     except Exception as e:
         logger.error(f"Failed to log run_dir to wandb: {e}")
     logger.info("Logging the run directory as an artifact... Done")
-

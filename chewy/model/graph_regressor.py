@@ -1,4 +1,8 @@
-
+# Copyright (c) 2025, Chunan Liu and Aurélien Plüsser
+# All rights reserved.
+#
+# This source code is licensed under the CC BY-NC-SA 4.0 license found in the
+# LICENSE file in the root directory of this source tree.
 
 import torch
 import torch.nn as nn
