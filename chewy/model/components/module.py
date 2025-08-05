@@ -17,17 +17,15 @@ class GATModule(nn.Module):
         out_channels: int, 
         heads: int = 1,
         dropout: float = 0.0,
-        use_msg_norm: bool = True
     ):
         super().__init__()
         
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.use_msg_norm = use_msg_norm
         
         # Pre-activation components
         self.norm = LayerNorm(in_channels)
-        self.activation = nn.ReLU(inplace=True)
+        self.activation = F.ReLU(inplace=True)
         
         # GAT layer - output should match input for residual connection
         self.gat = GATv2Conv(
@@ -49,8 +47,10 @@ class GATModule(nn.Module):
         x = self.norm(x)
         x = self.activation(x)
         gat_out = self.gat(x, edge_index)
-        
-        return residual + gat_out
+
+        if self.in_channels == self.out_channels:
+            return residual + gat_out
+        return gat_out
 
 
 

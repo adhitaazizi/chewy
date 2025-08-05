@@ -64,13 +64,17 @@ class ChewyRegression(L.LightningModule):
                                     node_feat_name="x_b", 
                                     edge_index_name="edge_index_b",
                                     input_dim=512,
-                                    dim_list=[512, 512, 512, 512, 512, 512, 512, 128, 64]
+                                    dim_list=[512, 512, 512, 512, 512, 512, 512, 128, 64],
+                                    heads=4,
+                                    dropout=0.3
                                 )
         self.G_encoder_block = ChewyEncoder(
                                     node_feat_name="x_b", 
                                     edge_index_name="edge_index_b",
                                     input_dim=1280,
-                                    dim_list=[1280, 1280, 1280, 1280, 1280, 1280, 1280, 128, 64]
+                                    dim_list=[1280, 1280, 1280, 1280, 1280, 1280, 1280, 128, 64],
+                                    heads=4,
+                                    dropout=0.3
         )
         logger.info(self.B_encoder_block)
         logger.info(self.G_encoder_block)
